@@ -669,14 +669,33 @@ function Ensure-HiDriveDirectory {
     }
 
     $currentSegments += [string]$segment
-    $response = Invoke-WebDavRequest -Method "MKCOL" -PathSegments $currentSegments
-    if ($response.StatusCode -notin @(200, 201, 204, 301, 302, 405)) {
-      throw (
-        "WebDAV-Verzeichnis '{0}' konnte nicht angelegt werden (HTTP {1})." -f
-        (Join-StoragePath -Segments $currentSegments),
-        $response.StatusCode
-      )
+    try {
+      if (Test-WebDavDirectoryExists -PathSegments $currentSegments) {
+        continue
+      }
+    } catch {
+      # Fall through to MKCOL and a follow-up existence check. Some providers
+      # answer inconsistently on shared or virtual path segments such as /users.
     }
+
+    $response = Invoke-WebDavRequest -Method "MKCOL" -PathSegments $currentSegments
+    if ($response.StatusCode -in @(200, 201, 204, 301, 302, 405)) {
+      continue
+    }
+
+    try {
+      if (Test-WebDavDirectoryExists -PathSegments $currentSegments) {
+        continue
+      }
+    } catch {
+      # Keep the original error below when the directory still is not readable.
+    }
+
+    throw (
+      "WebDAV-Verzeichnis '{0}' konnte nicht angelegt werden (HTTP {1})." -f
+      (Join-StoragePath -Segments $currentSegments),
+      $response.StatusCode
+    )
   }
 
   return (Join-StoragePath -Segments $PathSegments)
