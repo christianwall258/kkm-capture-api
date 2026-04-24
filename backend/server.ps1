@@ -1,13 +1,12 @@
 param(
   [int]$Port = $(if ([string]::IsNullOrWhiteSpace($env:PORT)) { 8787 } else { [int]$env:PORT }),
-  [string]$DataPath = (Join-Path $PSScriptRoot "data\catalog.json"),
   [string]$UploadRoot = (Join-Path $PSScriptRoot "uploads"),
   [string]$LogPath = (Join-Path $PSScriptRoot "logs\server.log"),
   [string]$ApiToken = $env:KKM_API_TOKEN,
   [int]$MaxFilesPerBatch = 10,
   [int]$MaxRequestBytes = 26214400,
   [int]$MaxFileBytes = 8388608,
-  [string]$HiDriveBaseUrl = $(if ([string]::IsNullOrWhiteSpace($env:HIDRIVE_BASE_URL)) { "https://webdav.hidrive.strato.com" } else { $env:HIDRIVE_BASE_URL }),
+  [string]$HiDriveBaseUrl = $(if ([string]::IsNullOrWhiteSpace($env:HIDRIVE_BASE_URL)) { "https://webdav.hidrive.ionos.com" } else { $env:HIDRIVE_BASE_URL }),
   [string]$HiDriveUsername = $env:HIDRIVE_USERNAME,
   [string]$HiDrivePassword = $env:HIDRIVE_PASSWORD,
   [string]$HiDriveRoot = $(if ([string]::IsNullOrWhiteSpace($env:HIDRIVE_ROOT)) { "KKM Capture" } else { $env:HIDRIVE_ROOT })
@@ -51,25 +50,6 @@ function Write-LogEntry {
 
   $json = $entry | ConvertTo-Json -Depth 12 -Compress
   Add-Content -LiteralPath $LogPath -Value $json -Encoding UTF8
-}
-
-function Read-Catalog {
-  if (-not (Test-Path -LiteralPath $DataPath)) {
-    return [pscustomobject]@{
-      projects = @()
-      hdds = @()
-    }
-  }
-
-  $raw = Get-Content -LiteralPath $DataPath -Raw -Encoding UTF8
-  if ([string]::IsNullOrWhiteSpace($raw)) {
-    return [pscustomobject]@{
-      projects = @()
-      hdds = @()
-    }
-  }
-
-  return $raw | ConvertFrom-Json
 }
 
 function Ensure-UploadRoot {
@@ -117,6 +97,14 @@ function Get-HiDriveRootSegments {
   ))
 }
 
+function Get-StorageBaseSegments {
+  if ((Get-StorageMode) -eq "hidrive-webdav") {
+    return @(Get-HiDriveRootSegments)
+  }
+
+  return @()
+}
+
 function Join-StoragePath {
   param([string[]]$Segments = @())
 
@@ -136,238 +124,12 @@ function Get-StorageTargetDescription {
     if ([string]::IsNullOrWhiteSpace($target)) {
       return "/"
     }
-
     return $target
   }
 
   return $UploadRoot
 }
 
-function New-WebDavUri {
-  param([string[]]$PathSegments = @())
-
-  $base = [string]$HiDriveBaseUrl
-  if ([string]::IsNullOrWhiteSpace($base)) {
-    throw "HiDriveBaseUrl ist leer."
-  }
-
-  $base = $base.Trim().TrimEnd('/')
-  $encodedSegments = @()
-  foreach ($segment in $PathSegments) {
-    if ([string]::IsNullOrWhiteSpace([string]$segment)) {
-      continue
-    }
-
-    $encodedSegments += [System.Uri]::EscapeDataString([string]$segment)
-  }
-
-  if ($encodedSegments.Count -eq 0) {
-    return [System.Uri]::new("$base/")
-  }
-
-  return [System.Uri]::new($base + "/" + ($encodedSegments -join "/"))
-}
-
-function Get-WebDavAuthorizationHeader {
-  $rawValue = "{0}:{1}" -f $HiDriveUsername, $HiDrivePassword
-  $authBytes = [System.Text.Encoding]::UTF8.GetBytes($rawValue)
-  return "Basic " + [Convert]::ToBase64String($authBytes)
-}
-
-function Invoke-WebDavRequest {
-  param(
-    [string]$Method,
-    [string[]]$PathSegments = @(),
-    [hashtable]$Headers = @{},
-    [byte[]]$BodyBytes,
-    [string]$BodyText = "",
-    [string]$ContentType = ""
-  )
-
-  $client = $null
-  $message = $null
-  $response = $null
-
-  try {
-    $uri = New-WebDavUri -PathSegments $PathSegments
-    $message = [System.Net.Http.HttpRequestMessage]::new(
-      [System.Net.Http.HttpMethod]::new($Method),
-      $uri
-    )
-    [void]$message.Headers.TryAddWithoutValidation(
-      "Authorization",
-      (Get-WebDavAuthorizationHeader)
-    )
-
-    foreach ($entry in $Headers.GetEnumerator()) {
-      [void]$message.Headers.TryAddWithoutValidation(
-        [string]$entry.Key,
-        [string]$entry.Value
-      )
-    }
-
-    $hasBody = $PSBoundParameters.ContainsKey("BodyBytes")
-    if (-not $hasBody -and $PSBoundParameters.ContainsKey("BodyText")) {
-      $BodyBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$BodyText)
-      $hasBody = $true
-    }
-
-    if ($hasBody) {
-      $content = [System.Net.Http.ByteArrayContent]::new([byte[]]$BodyBytes)
-      if (-not [string]::IsNullOrWhiteSpace($ContentType)) {
-        $content.Headers.ContentType =
-          [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse($ContentType)
-      }
-      $message.Content = $content
-    }
-
-    $client = [System.Net.Http.HttpClient]::new()
-    $client.Timeout = [TimeSpan]::FromSeconds(90)
-
-    $response = $client.SendAsync($message).GetAwaiter().GetResult()
-    $responseText = ""
-    if ($null -ne $response.Content) {
-      $responseText = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-    }
-
-    return [pscustomobject]@{
-      StatusCode = [int]$response.StatusCode
-      ReasonPhrase = [string]$response.ReasonPhrase
-      Body = $responseText
-      Uri = $uri.AbsoluteUri
-    }
-  } finally {
-    if ($null -ne $response) {
-      $response.Dispose()
-    }
-    if ($null -ne $message) {
-      $message.Dispose()
-    }
-    if ($null -ne $client) {
-      $client.Dispose()
-    }
-  }
-}
-
-function Get-WebDavPropfindBody {
-  return '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname /><d:resourcetype /></d:prop></d:propfind>'
-}
-
-function Ensure-HiDriveDirectory {
-  param([string[]]$PathSegments)
-
-  $currentSegments = @()
-  foreach ($segment in $PathSegments) {
-    if ([string]::IsNullOrWhiteSpace([string]$segment)) {
-      continue
-    }
-
-    $currentSegments += [string]$segment
-    $response = Invoke-WebDavRequest -Method "MKCOL" -PathSegments $currentSegments
-    if ($response.StatusCode -notin @(200, 201, 204, 301, 302, 405)) {
-      throw (
-        "WebDAV-Verzeichnis '{0}' konnte nicht angelegt werden (HTTP {1})." -f
-        (Join-StoragePath -Segments $currentSegments),
-        $response.StatusCode
-      )
-    }
-  }
-
-  return (Join-StoragePath -Segments $PathSegments)
-}
-
-function Get-WebDavNameFromHref {
-  param([string]$Href)
-
-  if ([string]::IsNullOrWhiteSpace($Href)) {
-    return ""
-  }
-
-  $path = $Href
-  try {
-    if ($Href -match '^https?://') {
-      $path = ([System.Uri]::new($Href)).AbsolutePath
-    }
-  } catch {
-    $path = $Href
-  }
-
-  $trimmed = [string]$path
-  while ($trimmed.EndsWith('/')) {
-    $trimmed = $trimmed.Substring(0, $trimmed.Length - 1)
-  }
-
-  if ([string]::IsNullOrWhiteSpace($trimmed)) {
-    return ""
-  }
-
-  $name = [System.IO.Path]::GetFileName($trimmed)
-  if ([string]::IsNullOrWhiteSpace($name)) {
-    return ""
-  }
-
-  return [System.Uri]::UnescapeDataString($name)
-}
-
-function Get-WebDavFiles {
-  param([string[]]$PathSegments)
-
-  $response = Invoke-WebDavRequest `
-    -Method "PROPFIND" `
-    -PathSegments $PathSegments `
-    -Headers @{ Depth = "1" } `
-    -BodyText (Get-WebDavPropfindBody) `
-    -ContentType "application/xml; charset=utf-8"
-
-  if ($response.StatusCode -eq 404) {
-    return @()
-  }
-
-  if ($response.StatusCode -notin @(200, 207)) {
-    throw "WebDAV-Dateiliste konnte nicht geladen werden (HTTP $($response.StatusCode))."
-  }
-
-  if ([string]::IsNullOrWhiteSpace($response.Body)) {
-    return @()
-  }
-
-  try {
-    [xml]$xml = $response.Body
-  } catch {
-    throw "WebDAV-Dateiliste ist kein gueltiges XML."
-  }
-
-  $namespaceManager = [System.Xml.XmlNamespaceManager]::new($xml.NameTable)
-  $namespaceManager.AddNamespace("d", "DAV:")
-  $responses = $xml.SelectNodes("//d:response", $namespaceManager)
-  $files = @()
-
-  foreach ($node in $responses) {
-    $collectionNode = $node.SelectSingleNode(
-      ".//d:resourcetype/d:collection",
-      $namespaceManager
-    )
-    if ($null -ne $collectionNode) {
-      continue
-    }
-
-    $hrefNode = $node.SelectSingleNode("d:href", $namespaceManager)
-    if ($null -eq $hrefNode) {
-      continue
-    }
-
-    $name = Get-WebDavNameFromHref -Href ([string]$hrefNode.InnerText)
-    if ([string]::IsNullOrWhiteSpace($name)) {
-      continue
-    }
-
-    $files += [pscustomobject]@{
-      Name = $name
-    }
-  }
-
-  return $files
-}
 function Get-PathSegments {
   param([System.Uri]$Url)
 
@@ -591,8 +353,7 @@ function Get-SafeName {
   $safe = $safe.Replace(([string][char]0x00FC), "ue")
   $safe = $safe.Replace(([string][char]0x00DF), "ss")
 
-  $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
-  foreach ($invalidChar in $invalidChars) {
+  foreach ($invalidChar in [System.IO.Path]::GetInvalidFileNameChars()) {
     $safe = $safe.Replace([string]$invalidChar, "_")
   }
 
@@ -606,15 +367,47 @@ function Get-SafeName {
   return $safe
 }
 
+function Get-StorageFolderName {
+  param([string]$Value)
+
+  if ([string]::IsNullOrWhiteSpace($Value)) {
+    return "item"
+  }
+
+  $name = $Value.Trim()
+  foreach ($invalidChar in [System.IO.Path]::GetInvalidFileNameChars()) {
+    $name = $name.Replace([string]$invalidChar, "_")
+  }
+  $name = $name.Replace('/', '_').Replace('\', '_')
+  $name = ($name -replace '\s{2,}', ' ').Trim()
+
+  if ([string]::IsNullOrWhiteSpace($name)) {
+    return "item"
+  }
+
+  return $name
+}
+
+function Resolve-SideValue {
+  param([string]$Side)
+
+  $normalizedSide = if ($null -eq $Side) { "" } else { $Side }
+
+  switch ($normalizedSide.Trim().ToLowerInvariant()) {
+    "entry" { return "entry" }
+    "eintritt" { return "entry" }
+    "exit" { return "exit" }
+    "austritt" { return "exit" }
+    default { throw "Seite '$Side' ist ungueltig." }
+  }
+}
+
 function Get-SideLabel {
   param([string]$Side)
 
-  switch ($Side.ToLowerInvariant()) {
+  switch (Resolve-SideValue -Side $Side) {
     "entry" { return "Eintritt" }
-    "eintritt" { return "Eintritt" }
     "exit" { return "Austritt" }
-    "austritt" { return "Austritt" }
-    default { return (Get-SafeName -Value $Side) }
   }
 }
 
@@ -649,7 +442,9 @@ function Get-FileExtension {
     return $extension.ToLowerInvariant()
   }
 
-  switch ($ContentType.ToLowerInvariant()) {
+  $normalizedContentType = if ($null -eq $ContentType) { "" } else { $ContentType }
+
+  switch ($normalizedContentType.ToLowerInvariant()) {
     "image/png" { return ".png" }
     "image/webp" { return ".webp" }
     "image/heic" { return ".heic" }
@@ -657,21 +452,541 @@ function Get-FileExtension {
   }
 }
 
-function Get-NextSequenceNumberFromFileNames {
-  param([string[]]$Names)
+function Get-LocalStorageDirectoryPath {
+  param(
+    [string[]]$PathSegments = @(),
+    [switch]$EnsureExists
+  )
+
+  if ($EnsureExists) {
+    Ensure-UploadRoot
+  }
+
+  $targetPath = $UploadRoot
+  foreach ($segment in $PathSegments) {
+    if ([string]::IsNullOrWhiteSpace([string]$segment)) {
+      continue
+    }
+    $targetPath = Join-Path $targetPath $segment
+  }
+
+  if ($EnsureExists) {
+    Ensure-Directory -Path $targetPath | Out-Null
+  }
+
+  return $targetPath
+}
+
+function Get-LocalStorageDirectories {
+  param([string[]]$PathSegments = @())
+
+  $targetPath = Get-LocalStorageDirectoryPath -PathSegments $PathSegments
+  if (-not (Test-Path -LiteralPath $targetPath -PathType Container)) {
+    return @()
+  }
+
+  return @(
+    Get-ChildItem -LiteralPath $targetPath -Directory -ErrorAction SilentlyContinue |
+      Sort-Object -Property Name |
+      ForEach-Object {
+        [pscustomobject]@{
+          Name = $_.Name
+        }
+      }
+  )
+}
+
+function Get-LocalStorageFiles {
+  param([string[]]$PathSegments = @())
+
+  $targetPath = Get-LocalStorageDirectoryPath -PathSegments $PathSegments
+  if (-not (Test-Path -LiteralPath $targetPath -PathType Container)) {
+    return @()
+  }
+
+  return @(
+    Get-ChildItem -LiteralPath $targetPath -File -ErrorAction SilentlyContinue |
+      Sort-Object -Property Name |
+      ForEach-Object {
+        [pscustomobject]@{
+          Name = $_.Name
+        }
+      }
+  )
+}
+
+function Test-LocalStorageDirectoryExists {
+  param([string[]]$PathSegments = @())
+
+  $targetPath = Get-LocalStorageDirectoryPath -PathSegments $PathSegments
+  return Test-Path -LiteralPath $targetPath -PathType Container
+}
+
+function Save-LocalStorageFile {
+  param(
+    [string[]]$PathSegments = @(),
+    [string]$FileName,
+    [byte[]]$ContentBytes
+  )
+
+  $targetDirectory = Get-LocalStorageDirectoryPath -PathSegments $PathSegments -EnsureExists
+  $targetPath = Join-Path $targetDirectory $FileName
+  [System.IO.File]::WriteAllBytes($targetPath, [byte[]]$ContentBytes)
+}
+
+function Save-LocalStorageText {
+  param(
+    [string[]]$PathSegments = @(),
+    [string]$FileName,
+    [string]$ContentText
+  )
+
+  $targetDirectory = Get-LocalStorageDirectoryPath -PathSegments $PathSegments -EnsureExists
+  $targetPath = Join-Path $targetDirectory $FileName
+  [System.IO.File]::WriteAllText(
+    $targetPath,
+    $ContentText,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+}
+
+function New-WebDavUri {
+  param([string[]]$PathSegments = @())
+
+  $base = [string]$HiDriveBaseUrl
+  if ([string]::IsNullOrWhiteSpace($base)) {
+    throw "HiDriveBaseUrl ist leer."
+  }
+
+  $base = $base.Trim().TrimEnd('/')
+  $encodedSegments = @()
+  foreach ($segment in $PathSegments) {
+    if ([string]::IsNullOrWhiteSpace([string]$segment)) {
+      continue
+    }
+    $encodedSegments += [System.Uri]::EscapeDataString([string]$segment)
+  }
+
+  if ($encodedSegments.Count -eq 0) {
+    return [System.Uri]::new("$base/")
+  }
+
+  return [System.Uri]::new($base + "/" + ($encodedSegments -join "/"))
+}
+
+function Get-WebDavAuthorizationHeader {
+  $rawValue = "{0}:{1}" -f $HiDriveUsername, $HiDrivePassword
+  $authBytes = [System.Text.Encoding]::UTF8.GetBytes($rawValue)
+  return "Basic " + [Convert]::ToBase64String($authBytes)
+}
+
+function Invoke-WebDavRequest {
+  param(
+    [string]$Method,
+    [string[]]$PathSegments = @(),
+    [hashtable]$Headers = @{},
+    [byte[]]$BodyBytes,
+    [string]$BodyText = "",
+    [string]$ContentType = ""
+  )
+
+  $client = $null
+  $message = $null
+  $response = $null
+
+  try {
+    $uri = New-WebDavUri -PathSegments $PathSegments
+    $message = [System.Net.Http.HttpRequestMessage]::new(
+      [System.Net.Http.HttpMethod]::new($Method),
+      $uri
+    )
+    [void]$message.Headers.TryAddWithoutValidation(
+      "Authorization",
+      (Get-WebDavAuthorizationHeader)
+    )
+
+    foreach ($entry in $Headers.GetEnumerator()) {
+      [void]$message.Headers.TryAddWithoutValidation(
+        [string]$entry.Key,
+        [string]$entry.Value
+      )
+    }
+
+    $hasBody = $PSBoundParameters.ContainsKey("BodyBytes")
+    if (-not $hasBody -and $PSBoundParameters.ContainsKey("BodyText")) {
+      $BodyBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$BodyText)
+      $hasBody = $true
+    }
+
+    if ($hasBody) {
+      $content = [System.Net.Http.ByteArrayContent]::new([byte[]]$BodyBytes)
+      if (-not [string]::IsNullOrWhiteSpace($ContentType)) {
+        $content.Headers.ContentType =
+          [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse($ContentType)
+      }
+      $message.Content = $content
+    }
+
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.Timeout = [TimeSpan]::FromSeconds(90)
+
+    $response = $client.SendAsync($message).GetAwaiter().GetResult()
+    $responseText = ""
+    if ($null -ne $response.Content) {
+      $responseText = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    }
+
+    return [pscustomobject]@{
+      StatusCode = [int]$response.StatusCode
+      ReasonPhrase = [string]$response.ReasonPhrase
+      Body = $responseText
+      Uri = $uri.AbsoluteUri
+    }
+  } finally {
+    if ($null -ne $response) {
+      $response.Dispose()
+    }
+    if ($null -ne $message) {
+      $message.Dispose()
+    }
+    if ($null -ne $client) {
+      $client.Dispose()
+    }
+  }
+}
+
+function Get-WebDavPropfindBody {
+  return '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:displayname /><d:resourcetype /></d:prop></d:propfind>'
+}
+
+function Ensure-HiDriveDirectory {
+  param([string[]]$PathSegments)
+
+  $currentSegments = @()
+  foreach ($segment in $PathSegments) {
+    if ([string]::IsNullOrWhiteSpace([string]$segment)) {
+      continue
+    }
+
+    $currentSegments += [string]$segment
+    $response = Invoke-WebDavRequest -Method "MKCOL" -PathSegments $currentSegments
+    if ($response.StatusCode -notin @(200, 201, 204, 301, 302, 405)) {
+      throw (
+        "WebDAV-Verzeichnis '{0}' konnte nicht angelegt werden (HTTP {1})." -f
+        (Join-StoragePath -Segments $currentSegments),
+        $response.StatusCode
+      )
+    }
+  }
+
+  return (Join-StoragePath -Segments $PathSegments)
+}
+
+function Get-WebDavNameFromHref {
+  param([string]$Href)
+
+  if ([string]::IsNullOrWhiteSpace($Href)) {
+    return ""
+  }
+
+  $path = $Href
+  try {
+    if ($Href -match '^https?://') {
+      $path = ([System.Uri]::new($Href)).AbsolutePath
+    }
+  } catch {
+    $path = $Href
+  }
+
+  $trimmed = [string]$path
+  while ($trimmed.EndsWith('/')) {
+    $trimmed = $trimmed.Substring(0, $trimmed.Length - 1)
+  }
+
+  if ([string]::IsNullOrWhiteSpace($trimmed)) {
+    return ""
+  }
+
+  $name = [System.IO.Path]::GetFileName($trimmed)
+  if ([string]::IsNullOrWhiteSpace($name)) {
+    return ""
+  }
+
+  return [System.Uri]::UnescapeDataString($name)
+}
+
+function Get-WebDavDirectoryListing {
+  param([string[]]$PathSegments = @())
+
+  $response = Invoke-WebDavRequest `
+    -Method "PROPFIND" `
+    -PathSegments $PathSegments `
+    -Headers @{ Depth = "1" } `
+    -BodyText (Get-WebDavPropfindBody) `
+    -ContentType "application/xml; charset=utf-8"
+
+  if ($response.StatusCode -eq 404) {
+    return @()
+  }
+
+  if ($response.StatusCode -notin @(200, 207)) {
+    throw "WebDAV-Verzeichnisliste konnte nicht geladen werden (HTTP $($response.StatusCode))."
+  }
+
+  if ([string]::IsNullOrWhiteSpace($response.Body)) {
+    return @()
+  }
+
+  try {
+    [xml]$xml = $response.Body
+  } catch {
+    throw "WebDAV-Verzeichnisliste ist kein gueltiges XML."
+  }
+
+  $namespaceManager = [System.Xml.XmlNamespaceManager]::new($xml.NameTable)
+  $namespaceManager.AddNamespace("d", "DAV:")
+  $responses = $xml.SelectNodes("//d:response", $namespaceManager)
+  $requestedPath = (New-WebDavUri -PathSegments $PathSegments).AbsolutePath.TrimEnd('/')
+  $items = @()
+
+  foreach ($node in $responses) {
+    $hrefNode = $node.SelectSingleNode("d:href", $namespaceManager)
+    if ($null -eq $hrefNode) {
+      continue
+    }
+
+    $hrefText = [string]$hrefNode.InnerText
+    $hrefPath = $hrefText
+    try {
+      if ($hrefText -match '^https?://') {
+        $hrefPath = ([System.Uri]::new($hrefText)).AbsolutePath
+      }
+    } catch {
+      $hrefPath = $hrefText
+    }
+
+    if ($hrefPath.TrimEnd('/') -eq $requestedPath) {
+      continue
+    }
+
+    $name = Get-WebDavNameFromHref -Href $hrefText
+    if ([string]::IsNullOrWhiteSpace($name)) {
+      continue
+    }
+
+    $isCollection = $null -ne $node.SelectSingleNode(
+      ".//d:resourcetype/d:collection",
+      $namespaceManager
+    )
+
+    $items += [pscustomobject]@{
+      Name = $name
+      IsDirectory = $isCollection
+    }
+  }
+
+  return $items
+}
+
+function Get-WebDavDirectories {
+  param([string[]]$PathSegments = @())
+
+  return @(
+    Get-WebDavDirectoryListing -PathSegments $PathSegments |
+      Where-Object { $_.IsDirectory } |
+      Sort-Object -Property Name |
+      ForEach-Object {
+        [pscustomobject]@{
+          Name = $_.Name
+        }
+      }
+  )
+}
+
+function Get-WebDavFiles {
+  param([string[]]$PathSegments = @())
+
+  return @(
+    Get-WebDavDirectoryListing -PathSegments $PathSegments |
+      Where-Object { -not $_.IsDirectory } |
+      Sort-Object -Property Name |
+      ForEach-Object {
+        [pscustomobject]@{
+          Name = $_.Name
+        }
+      }
+  )
+}
+
+function Test-WebDavDirectoryExists {
+  param([string[]]$PathSegments = @())
+
+  $response = Invoke-WebDavRequest `
+    -Method "PROPFIND" `
+    -PathSegments $PathSegments `
+    -Headers @{ Depth = "0" } `
+    -BodyText (Get-WebDavPropfindBody) `
+    -ContentType "application/xml; charset=utf-8"
+
+  if ($response.StatusCode -eq 404) {
+    return $false
+  }
+
+  if ($response.StatusCode -notin @(200, 207)) {
+    throw "WebDAV-Verzeichnis konnte nicht geprueft werden (HTTP $($response.StatusCode))."
+  }
+
+  return $true
+}
+
+function Save-WebDavFile {
+  param(
+    [string[]]$PathSegments = @(),
+    [string]$FileName,
+    [byte[]]$ContentBytes,
+    [string]$ContentType
+  )
+
+  $response = Invoke-WebDavRequest `
+    -Method "PUT" `
+    -PathSegments (@($PathSegments) + @($FileName)) `
+    -BodyBytes $ContentBytes `
+    -ContentType $ContentType
+
+  if ($response.StatusCode -notin @(200, 201, 204)) {
+    throw "WebDAV-Datei '$FileName' konnte nicht gespeichert werden (HTTP $($response.StatusCode))."
+  }
+}
+
+function Save-WebDavText {
+  param(
+    [string[]]$PathSegments = @(),
+    [string]$FileName,
+    [string]$ContentText
+  )
+
+  Save-WebDavFile `
+    -PathSegments $PathSegments `
+    -FileName $FileName `
+    -ContentBytes ([System.Text.Encoding]::UTF8.GetBytes($ContentText)) `
+    -ContentType "application/json; charset=utf-8"
+}
+
+function Ensure-StorageDirectory {
+  param([string[]]$PathSegments = @())
+
+  if ((Get-StorageMode) -eq "hidrive-webdav") {
+    Ensure-HiDriveDirectory -PathSegments $PathSegments | Out-Null
+    return (Join-StoragePath -Segments $PathSegments)
+  }
+
+  return (Get-LocalStorageDirectoryPath -PathSegments $PathSegments -EnsureExists)
+}
+
+function Get-StorageDirectories {
+  param([string[]]$PathSegments = @())
+
+  if ((Get-StorageMode) -eq "hidrive-webdav") {
+    return @(Get-WebDavDirectories -PathSegments $PathSegments)
+  }
+
+  return @(Get-LocalStorageDirectories -PathSegments $PathSegments)
+}
+
+function Get-StorageFiles {
+  param([string[]]$PathSegments = @())
+
+  if ((Get-StorageMode) -eq "hidrive-webdav") {
+    return @(Get-WebDavFiles -PathSegments $PathSegments)
+  }
+
+  return @(Get-LocalStorageFiles -PathSegments $PathSegments)
+}
+
+function Test-StorageDirectoryExists {
+  param([string[]]$PathSegments = @())
+
+  if ($PathSegments.Count -eq 0) {
+    return $true
+  }
+
+  if ((Get-StorageMode) -eq "hidrive-webdav") {
+    return Test-WebDavDirectoryExists -PathSegments $PathSegments
+  }
+
+  return Test-LocalStorageDirectoryExists -PathSegments $PathSegments
+}
+
+function Save-StorageFile {
+  param(
+    [string[]]$PathSegments = @(),
+    [string]$FileName,
+    [byte[]]$ContentBytes,
+    [string]$ContentType
+  )
+
+  if ((Get-StorageMode) -eq "hidrive-webdav") {
+    Save-WebDavFile `
+      -PathSegments $PathSegments `
+      -FileName $FileName `
+      -ContentBytes $ContentBytes `
+      -ContentType $ContentType
+    return
+  }
+
+  Save-LocalStorageFile `
+    -PathSegments $PathSegments `
+    -FileName $FileName `
+    -ContentBytes $ContentBytes
+}
+
+function Save-StorageText {
+  param(
+    [string[]]$PathSegments = @(),
+    [string]$FileName,
+    [string]$ContentText
+  )
+
+  if ((Get-StorageMode) -eq "hidrive-webdav") {
+    Save-WebDavText `
+      -PathSegments $PathSegments `
+      -FileName $FileName `
+      -ContentText $ContentText
+    return
+  }
+
+  Save-LocalStorageText `
+    -PathSegments $PathSegments `
+    -FileName $FileName `
+    -ContentText $ContentText
+}
+
+function Get-StorageRelativePath {
+  param([string[]]$PathSegments = @())
+
+  if ((Get-StorageMode) -eq "hidrive-webdav") {
+    return (Join-StoragePath -Segments $PathSegments)
+  }
+
+  $targetDirectory = Get-LocalStorageDirectoryPath -PathSegments $PathSegments -EnsureExists
+  $workspaceRoot = (Resolve-Path -LiteralPath (Split-Path -Path $PSScriptRoot -Parent)).Path
+  $resolvedTargetDirectory = (Resolve-Path -LiteralPath $targetDirectory).Path
+  if ($resolvedTargetDirectory.StartsWith($workspaceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    return $resolvedTargetDirectory.Substring($workspaceRoot.Length).TrimStart('\').Replace("\", "/")
+  }
+
+  return $resolvedTargetDirectory.Replace("\", "/")
+}
+
+function Get-NextSequenceNumber {
+  param([string[]]$TargetPathSegments = @())
 
   $maxNumber = 0
-  foreach ($name in $Names) {
-    if ([string]::IsNullOrWhiteSpace([string]$name)) {
-      continue
-    }
+  $existingFiles = Get-StorageFiles -PathSegments $TargetPathSegments |
+    Where-Object { $_.Name -match '\.(jpg|jpeg|png|webp|heic)$' }
 
-    $extension = [System.IO.Path]::GetExtension([string]$name)
-    if ($extension -notmatch '^\.(jpg|jpeg|png|webp|heic)$') {
-      continue
-    }
-
-    $baseName = [System.IO.Path]::GetFileNameWithoutExtension([string]$name)
+  foreach ($existingFile in $existingFiles) {
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension([string]$existingFile.Name)
     $numberMatch = [regex]::Match($baseName, '_(\d+)$')
     if (-not $numberMatch.Success) {
       continue
@@ -686,312 +1001,130 @@ function Get-NextSequenceNumberFromFileNames {
   return ($maxNumber + 1)
 }
 
-function Get-NextSequenceNumber {
-  param([string]$TargetDirectory)
+function ConvertTo-ProjectRecords {
+  param([object[]]$Directories = @())
 
-  $names = @(
-    Get-ChildItem -LiteralPath $TargetDirectory -File -ErrorAction SilentlyContinue |
-      ForEach-Object { $_.Name }
+  return @(
+    $Directories |
+      Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Name) } |
+      Sort-Object -Property { $_.Name.ToLowerInvariant() } |
+      ForEach-Object {
+        [pscustomobject]@{
+          id = [string]$_.Name
+          name = [string]$_.Name
+        }
+      }
   )
-
-  return Get-NextSequenceNumberFromFileNames -Names $names
 }
 
-function Get-NextWebDavSequenceNumber {
-  param([string[]]$PathSegments)
+function ConvertTo-HddRecords {
+  param([object[]]$Directories = @())
 
-  $names = @(
-    Get-WebDavFiles -PathSegments $PathSegments |
-      ForEach-Object { [string]$_.Name }
+  return @(
+    $Directories |
+      Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Name) } |
+      Sort-Object -Property { $_.Name.ToLowerInvariant() } |
+      ForEach-Object {
+        [pscustomobject]@{
+          id = [string]$_.Name
+          name = [string]$_.Name
+        }
+      }
   )
-
-  return Get-NextSequenceNumberFromFileNames -Names $names
 }
 
-function New-BatchManifest {
-  param(
-    [string]$BatchId,
-    [pscustomobject]$Metadata,
-    [object[]]$SavedFiles,
-    [string]$StorageMode,
-    [string]$StoragePath
-  )
+function Get-ProjectRecordsFromStorage {
+  $directories = Get-StorageDirectories -PathSegments (Get-StorageBaseSegments)
+  return ConvertTo-ProjectRecords -Directories $directories
+}
 
-  return [ordered]@{
-    batchId = $BatchId
-    uploadedAt = (Get-Date).ToUniversalTime().ToString("o")
-    projectId = $Metadata.projectId
-    projectName = $Metadata.projectName
-    hddId = $Metadata.hddId
-    hddName = $Metadata.hddName
-    side = $Metadata.side
-    sideLabel = $Metadata.sideLabel
-    fileCount = @($SavedFiles).Count
-    storageMode = $StorageMode
-    storagePath = $StoragePath
-    files = $SavedFiles
+function Get-HddRecordsFromStorage {
+  param([string]$ProjectId)
+
+  $projectSegments = @((Get-StorageBaseSegments) + @($ProjectId))
+  if (-not (Test-StorageDirectoryExists -PathSegments $projectSegments)) {
+    return $null
+  }
+
+  $directories = Get-StorageDirectories -PathSegments $projectSegments
+  return ConvertTo-HddRecords -Directories $directories
+}
+
+function Test-StorageHealth {
+  if ((Get-StorageMode) -eq "local") {
+    Ensure-UploadRoot
+    return [pscustomobject]@{
+      status = "ok"
+      cloud = "connected"
+      message = "Lokaler Speicher bereit."
+      storageMode = "local"
+      storageTarget = Get-StorageTargetDescription
+    }
+  }
+
+  try {
+    Ensure-HiDriveDirectory -PathSegments (Get-HiDriveRootSegments) | Out-Null
+    [void](Get-StorageDirectories -PathSegments (Get-HiDriveRootSegments))
+    return [pscustomobject]@{
+      status = "ok"
+      cloud = "connected"
+      message = "HiDrive erreichbar."
+      storageMode = "hidrive-webdav"
+      storageTarget = Get-StorageTargetDescription
+    }
+  } catch {
+    return [pscustomobject]@{
+      status = "warn"
+      cloud = "disconnected"
+      message = "HiDrive nicht erreichbar."
+      storageMode = "hidrive-webdav"
+      storageTarget = Get-StorageTargetDescription
+      error = $_.Exception.Message
+    }
   }
 }
 
 function Resolve-UploadMetadata {
   param([pscustomobject]$Multipart)
 
-  $catalog = Read-Catalog
-  $projectId = [string]$Multipart.Fields["projectId"]
-  $projectName = [string]$Multipart.Fields["projectName"]
-  $hddId = [string]$Multipart.Fields["hddId"]
-  $hddName = [string]$Multipart.Fields["hddName"]
+  $projectId = ([string]$Multipart.Fields["projectId"]).Trim()
+  $projectName = ([string]$Multipart.Fields["projectName"]).Trim()
+  $hddId = ([string]$Multipart.Fields["hddId"]).Trim()
+  $hddName = ([string]$Multipart.Fields["hddName"]).Trim()
   $side = [string]$Multipart.Fields["side"]
 
-  $project = @($catalog.projects | Where-Object { $_.id -eq $projectId }) |
-    Select-Object -First 1
-  $hdd = @($catalog.hdds | Where-Object { $_.id -eq $hddId }) |
-    Select-Object -First 1
-
-  $resolvedProjectName = if ($null -ne $project) {
-    [string]$project.name
-  } elseif (-not [string]::IsNullOrWhiteSpace($projectName)) {
+  $resolvedProjectName = if (-not [string]::IsNullOrWhiteSpace($projectName)) {
     $projectName
   } else {
     $projectId
   }
-
-  $resolvedHddName = if ($null -ne $hdd) {
-    [string]$hdd.name
-  } elseif (-not [string]::IsNullOrWhiteSpace($hddName)) {
+  $resolvedHddName = if (-not [string]::IsNullOrWhiteSpace($hddName)) {
     $hddName
   } else {
     $hddId
   }
 
-  $sideLabel = Get-SideLabel -Side $side
+  if ([string]::IsNullOrWhiteSpace($resolvedProjectName)) {
+    throw "Projekt fehlt."
+  }
+  if ([string]::IsNullOrWhiteSpace($resolvedHddName)) {
+    throw "HDD fehlt."
+  }
+
+  $resolvedSide = Resolve-SideValue -Side $side
+  $sideLabel = Get-SideLabel -Side $resolvedSide
 
   return [pscustomobject]@{
-    projectId = $projectId
+    projectId = if ([string]::IsNullOrWhiteSpace($projectId)) { $resolvedProjectName } else { $projectId }
     projectName = $resolvedProjectName
-    projectFolder = (Get-SafeName -Value $resolvedProjectName)
+    projectFolder = (Get-StorageFolderName -Value $resolvedProjectName)
     projectFileToken = (Get-SafeName -Value $resolvedProjectName)
-    hddId = $hddId
+    hddId = if ([string]::IsNullOrWhiteSpace($hddId)) { $resolvedHddName } else { $hddId }
     hddName = $resolvedHddName
-    hddFolder = (Get-SafeName -Value $resolvedHddName)
+    hddFolder = (Get-StorageFolderName -Value $resolvedHddName)
     hddFileToken = (Get-HddFileToken -Value $resolvedHddName)
-    side = $side
+    side = $resolvedSide
     sideLabel = $sideLabel
-  }
-}
-
-function Save-BatchToLocalUpload {
-  param(
-    [pscustomobject]$Multipart,
-    [pscustomobject]$Metadata,
-    [string]$BatchId,
-    [string]$DateToken
-  )
-
-  Ensure-UploadRoot
-
-  $projectDirectory = Ensure-Directory -Path (Join-Path $UploadRoot $Metadata.projectFolder)
-  $hddDirectory = Ensure-Directory -Path (Join-Path $projectDirectory $Metadata.hddFolder)
-  $targetDirectory = Ensure-Directory -Path (Join-Path $hddDirectory $Metadata.sideLabel)
-  $manifestDirectory = Ensure-Directory -Path (Join-Path $targetDirectory "_batches")
-
-  $savedFiles = @()
-  $counter = Get-NextSequenceNumber -TargetDirectory $targetDirectory
-
-  foreach ($file in $Multipart.Files) {
-    $originalName = [System.IO.Path]::GetFileName([string]$file.FileName)
-    $contentType = [string]$file.Headers["Content-Type"]
-    $extension = Get-FileExtension -FileName $originalName -ContentType $contentType
-    $storedName = "{0}_{1}_{2}_{3}_{4}{5}" -f `
-      $DateToken, `
-      $Metadata.projectFileToken, `
-      $Metadata.hddFileToken, `
-      $Metadata.sideLabel, `
-      $counter, `
-      $extension
-    $storedPath = Join-Path $targetDirectory $storedName
-
-    [System.IO.File]::WriteAllBytes($storedPath, [byte[]]$file.Bytes)
-
-    $savedFiles += [pscustomobject]@{
-      originalName = $originalName
-      storedName = $storedName
-      size = [int]$file.Bytes.Length
-      origin = [string]$file.Headers["X-Image-Origin"]
-      sequenceNumber = $counter
-    }
-
-    $counter++
-  }
-
-  $workspaceRoot = (Resolve-Path -LiteralPath (Split-Path -Path $PSScriptRoot -Parent)).Path
-  $resolvedTargetDirectory = (Resolve-Path -LiteralPath $targetDirectory).Path
-  if ($resolvedTargetDirectory.StartsWith($workspaceRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-    $storagePath = $resolvedTargetDirectory.Substring($workspaceRoot.Length).TrimStart('\\')
-  } else {
-    $storagePath = $resolvedTargetDirectory
-  }
-  $storagePath = $storagePath.Replace("\\", "/")
-
-  $manifest = New-BatchManifest `
-    -BatchId $BatchId `
-    -Metadata $Metadata `
-    -SavedFiles $savedFiles `
-    -StorageMode "local" `
-    -StoragePath $storagePath
-  $manifestPath = Join-Path $manifestDirectory "$BatchId.json"
-  $manifestJson = $manifest | ConvertTo-Json -Depth 12
-  Set-Content -LiteralPath $manifestPath -Value $manifestJson -Encoding UTF8
-
-  return [pscustomobject]@{
-    batchId = $BatchId
-    uploadedCount = $savedFiles.Count
-    storagePath = $storagePath
-    files = $savedFiles
-    storageMode = "local"
-  }
-}
-
-function Save-BatchToHiDrive {
-  param(
-    [pscustomobject]$Multipart,
-    [pscustomobject]$Metadata,
-    [string]$BatchId,
-    [string]$DateToken
-  )
-
-  if (-not (Test-HiDriveConfigured)) {
-    throw "HiDrive ist nicht konfiguriert."
-  }
-
-  $rootSegments = @(Get-HiDriveRootSegments)
-  $projectSegments = @($rootSegments + @($Metadata.projectFolder))
-  $hddSegments = @($projectSegments + @($Metadata.hddFolder))
-  $targetSegments = @($hddSegments + @($Metadata.sideLabel))
-  $manifestSegments = @($targetSegments + @("_batches"))
-
-  [void](Ensure-HiDriveDirectory -PathSegments $projectSegments)
-  [void](Ensure-HiDriveDirectory -PathSegments $hddSegments)
-  [void](Ensure-HiDriveDirectory -PathSegments $targetSegments)
-  [void](Ensure-HiDriveDirectory -PathSegments $manifestSegments)
-
-  $savedFiles = @()
-  $counter = Get-NextWebDavSequenceNumber -PathSegments $targetSegments
-
-  foreach ($file in $Multipart.Files) {
-    $originalName = [System.IO.Path]::GetFileName([string]$file.FileName)
-    $contentType = [string]$file.Headers["Content-Type"]
-    $extension = Get-FileExtension -FileName $originalName -ContentType $contentType
-    $storedName = "{0}_{1}_{2}_{3}_{4}{5}" -f `
-      $DateToken, `
-      $Metadata.projectFileToken, `
-      $Metadata.hddFileToken, `
-      $Metadata.sideLabel, `
-      $counter, `
-      $extension
-
-    $uploadResponse = Invoke-WebDavRequest `
-      -Method "PUT" `
-      -PathSegments ($targetSegments + @($storedName)) `
-      -BodyBytes ([byte[]]$file.Bytes) `
-      -ContentType $contentType
-
-    if ($uploadResponse.StatusCode -notin @(200, 201, 204)) {
-      throw (
-        "HiDrive-Upload fuer '{0}' fehlgeschlagen (HTTP {1})." -f
-        $storedName,
-        $uploadResponse.StatusCode
-      )
-    }
-
-    $savedFiles += [pscustomobject]@{
-      originalName = $originalName
-      storedName = $storedName
-      size = [int]$file.Bytes.Length
-      origin = [string]$file.Headers["X-Image-Origin"]
-      sequenceNumber = $counter
-    }
-
-    $counter++
-  }
-
-  $storagePath = Join-StoragePath -Segments $targetSegments
-  $manifest = New-BatchManifest `
-    -BatchId $BatchId `
-    -Metadata $Metadata `
-    -SavedFiles $savedFiles `
-    -StorageMode "hidrive-webdav" `
-    -StoragePath $storagePath
-  $manifestJson = $manifest | ConvertTo-Json -Depth 12
-  $manifestResponse = Invoke-WebDavRequest `
-    -Method "PUT" `
-    -PathSegments ($manifestSegments + @("$BatchId.json")) `
-    -BodyText $manifestJson `
-    -ContentType "application/json; charset=utf-8"
-
-  if ($manifestResponse.StatusCode -notin @(200, 201, 204)) {
-    throw (
-      "HiDrive-Manifest fuer Batch '{0}' konnte nicht gespeichert werden (HTTP {1})." -f
-      $BatchId,
-      $manifestResponse.StatusCode
-    )
-  }
-
-  return [pscustomobject]@{
-    batchId = $BatchId
-    uploadedCount = $savedFiles.Count
-    storagePath = $storagePath
-    files = $savedFiles
-    storageMode = "hidrive-webdav"
-  }
-}
-
-function Test-StorageHealth {
-  $storageMode = Get-StorageMode
-  if ($storageMode -eq "local") {
-    Ensure-UploadRoot
-    return [pscustomobject]@{
-      status = "ok"
-      cloud = "connected"
-      storageMode = $storageMode
-      target = $UploadRoot
-      message = "Lokaler Upload-Speicher bereit."
-      error = ""
-    }
-  }
-
-  try {
-    $rootSegments = @(Get-HiDriveRootSegments)
-    if ($rootSegments.Count -gt 0) {
-      [void](Ensure-HiDriveDirectory -PathSegments $rootSegments)
-    } else {
-      $probe = Invoke-WebDavRequest `
-        -Method "PROPFIND" `
-        -Headers @{ Depth = "0" } `
-        -BodyText (Get-WebDavPropfindBody) `
-        -ContentType "application/xml; charset=utf-8"
-      if ($probe.StatusCode -notin @(200, 207)) {
-        throw "HiDrive-Root antwortet mit HTTP $($probe.StatusCode)."
-      }
-    }
-
-    return [pscustomobject]@{
-      status = "ok"
-      cloud = "connected"
-      storageMode = $storageMode
-      target = Get-StorageTargetDescription
-      message = "HiDrive erreichbar."
-      error = ""
-    }
-  } catch {
-    return [pscustomobject]@{
-      status = "warn"
-      cloud = "disconnected"
-      storageMode = $storageMode
-      target = Get-StorageTargetDescription
-      message = "HiDrive nicht erreichbar."
-      error = $_.Exception.Message
-    }
   }
 }
 
@@ -1002,20 +1135,77 @@ function Save-BatchUpload {
   $batchId = Get-Date -Format "yyyyMMdd-HHmmssfff"
   $dateToken = Get-Date -Format "yyMMdd"
 
-  if ((Get-StorageMode) -eq "hidrive-webdav") {
-    return Save-BatchToHiDrive `
-      -Multipart $Multipart `
-      -Metadata $metadata `
-      -BatchId $batchId `
-      -DateToken $dateToken
+  $projectSegments = @((Get-StorageBaseSegments) + @($metadata.projectFolder))
+  $hddSegments = @($projectSegments + @($metadata.hddFolder))
+  $targetSegments = @($hddSegments + @($metadata.sideLabel))
+  $manifestSegments = @($targetSegments + @("_batches"))
+
+  Ensure-StorageDirectory -PathSegments $projectSegments | Out-Null
+  Ensure-StorageDirectory -PathSegments $hddSegments | Out-Null
+  Ensure-StorageDirectory -PathSegments $targetSegments | Out-Null
+  Ensure-StorageDirectory -PathSegments $manifestSegments | Out-Null
+
+  $savedFiles = @()
+  $counter = Get-NextSequenceNumber -TargetPathSegments $targetSegments
+
+  foreach ($file in $Multipart.Files) {
+    $originalName = [System.IO.Path]::GetFileName([string]$file.FileName)
+    $contentType = [string]$file.Headers["Content-Type"]
+    $extension = Get-FileExtension -FileName $originalName -ContentType $contentType
+    $storedName = "{0}_{1}_{2}_{3}_{4}{5}" -f `
+      $dateToken, `
+      $metadata.projectFileToken, `
+      $metadata.hddFileToken, `
+      $metadata.sideLabel, `
+      $counter, `
+      $extension
+
+    Save-StorageFile `
+      -PathSegments $targetSegments `
+      -FileName $storedName `
+      -ContentBytes ([byte[]]$file.Bytes) `
+      -ContentType $contentType
+
+    $savedFiles += [pscustomobject]@{
+      originalName = $originalName
+      storedName = $storedName
+      size = [int]$file.Bytes.Length
+      origin = [string]$file.Headers["X-Image-Origin"]
+      sequenceNumber = $counter
+      storagePath = (Join-StoragePath -Segments (@($targetSegments) + @($storedName)))
+    }
+
+    $counter++
   }
 
-  return Save-BatchToLocalUpload `
-    -Multipart $Multipart `
-    -Metadata $metadata `
-    -BatchId $batchId `
-    -DateToken $dateToken
+  $manifest = [ordered]@{
+    batchId = $batchId
+    uploadedAt = (Get-Date).ToUniversalTime().ToString("o")
+    storageMode = Get-StorageMode
+    projectId = $metadata.projectId
+    projectName = $metadata.projectName
+    hddId = $metadata.hddId
+    hddName = $metadata.hddName
+    side = $metadata.side
+    sideLabel = $metadata.sideLabel
+    fileCount = $savedFiles.Count
+    files = $savedFiles
+  }
+
+  $manifestJson = $manifest | ConvertTo-Json -Depth 12
+  Save-StorageText `
+    -PathSegments $manifestSegments `
+    -FileName "$batchId.json" `
+    -ContentText $manifestJson
+
+  return [pscustomobject]@{
+    batchId = $batchId
+    uploadedCount = $savedFiles.Count
+    storagePath = (Get-StorageRelativePath -PathSegments $targetSegments)
+    files = $savedFiles
+  }
 }
+
 function Resolve-ApiRequest {
   param(
     [string]$Method,
@@ -1083,14 +1273,29 @@ function Resolve-ApiRequest {
         -RequestId $RequestId
     }
 
-    foreach ($fieldName in @("projectId", "hddId", "side")) {
-      if ([string]::IsNullOrWhiteSpace([string]$multipart.Fields[$fieldName])) {
+    foreach ($descriptor in @(
+      @{ key = "project"; value = [string]$multipart.Fields["projectId"]; fallback = [string]$multipart.Fields["projectName"] },
+      @{ key = "hdd"; value = [string]$multipart.Fields["hddId"]; fallback = [string]$multipart.Fields["hddName"] }
+    )) {
+      $primaryValue = if ($null -eq $descriptor.value) { "" } else { [string]$descriptor.value }
+      $fallbackValue = if ($null -eq $descriptor.fallback) { "" } else { [string]$descriptor.fallback }
+
+      if ([string]::IsNullOrWhiteSpace($primaryValue.Trim()) -and
+          [string]::IsNullOrWhiteSpace($fallbackValue.Trim())) {
         return New-ApiErrorResponse `
           -StatusCode 400 `
           -Code "missing_field" `
-          -Message "Feld '$fieldName' fehlt." `
+          -Message "Feld '$($descriptor.key)' fehlt." `
           -RequestId $RequestId
       }
+    }
+
+    if ([string]::IsNullOrWhiteSpace(([string]$multipart.Fields["side"]).Trim())) {
+      return New-ApiErrorResponse `
+        -StatusCode 400 `
+        -Code "missing_field" `
+        -Message "Feld 'side' fehlt." `
+        -RequestId $RequestId
     }
 
     $fileCount = @($multipart.Files).Count
@@ -1148,7 +1353,6 @@ function Resolve-ApiRequest {
         batchId = $savedBatch.batchId
         uploadedCount = $savedBatch.uploadedCount
         storagePath = $savedBatch.storagePath
-        storageMode = $savedBatch.storageMode
         files = $savedBatch.files
         requestId = $RequestId
       }
@@ -1189,52 +1393,56 @@ function Resolve-ApiRequest {
         "/uploads/batches"
       )
       authRequired = (-not [string]::IsNullOrWhiteSpace($ApiToken))
+      storageMode = Get-StorageMode
+      storageTarget = Get-StorageTargetDescription
       limits = @{
         maxFilesPerBatch = $MaxFilesPerBatch
         maxRequestBytes = $MaxRequestBytes
         maxFileBytes = $MaxFileBytes
       }
-      storage = @{
-        mode = Get-StorageMode
-        target = Get-StorageTargetDescription
-      }
     }
   }
 
   if ($segments.Count -eq 1 -and $segments[0] -eq "health") {
-    $storageHealth = Test-StorageHealth
-    $payload = [ordered]@{
-      status = $storageHealth.status
-      cloud = $storageHealth.cloud
+    $health = Test-StorageHealth
+    return New-ApiResponse -StatusCode 200 -Payload @{
+      status = $health.status
+      cloud = $health.cloud
+      message = $health.message
       checkedAt = (Get-Date).ToUniversalTime().ToString("o")
+      storageMode = $health.storageMode
+      storageTarget = $health.storageTarget
       authRequired = (-not [string]::IsNullOrWhiteSpace($ApiToken))
       limits = @{
         maxFilesPerBatch = $MaxFilesPerBatch
         maxRequestBytes = $MaxRequestBytes
         maxFileBytes = $MaxFileBytes
       }
-      storage = @{
-        mode = $storageHealth.storageMode
-        target = $storageHealth.target
-      }
     }
-
-    if (-not [string]::IsNullOrWhiteSpace([string]$storageHealth.message)) {
-      $payload.message = [string]$storageHealth.message
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace([string]$storageHealth.error)) {
-      $payload.error = [string]$storageHealth.error
-    }
-
-    return New-ApiResponse -StatusCode 200 -Payload $payload
   }
 
-  $catalog = Read-Catalog
-
   if ($segments.Count -eq 1 -and $segments[0] -eq "projects") {
-    return New-ApiResponse -StatusCode 200 -Payload @{
-      projects = @($catalog.projects)
+    try {
+      $projects = Get-ProjectRecordsFromStorage
+      return New-ApiResponse -StatusCode 200 -Payload @{
+        projects = @($projects)
+      }
+    } catch {
+      Write-LogEntry `
+        -Level "WARN" `
+        -Message "Projektordner konnten nicht geladen werden." `
+        -RequestId $RequestId `
+        -Method $Method `
+        -Path $Url.AbsolutePath `
+        -StatusCode 503 `
+        -Data @{
+          error = $_.Exception.Message
+        }
+      return New-ApiErrorResponse `
+        -StatusCode 503 `
+        -Code "projects_unavailable" `
+        -Message "Projektordner konnten nicht geladen werden." `
+        -RequestId $RequestId
     }
   }
 
@@ -1244,30 +1452,39 @@ function Resolve-ApiRequest {
     $segments[2] -eq "hdds"
   ) {
     $projectId = $segments[1]
-    $project = @($catalog.projects | Where-Object { $_.id -eq $projectId }) |
-      Select-Object -First 1
+    $projectSegments = @((Get-StorageBaseSegments) + @($projectId))
 
-    if ($null -eq $project) {
-      return New-ApiErrorResponse `
-        -StatusCode 404 `
-        -Code "project_not_found" `
-        -Message "Projekt '$projectId' wurde nicht gefunden." `
-        -RequestId $RequestId
-    }
+    try {
+      if (-not (Test-StorageDirectoryExists -PathSegments $projectSegments)) {
+        return New-ApiErrorResponse `
+          -StatusCode 404 `
+          -Code "project_not_found" `
+          -Message "Projekt '$projectId' wurde nicht gefunden." `
+          -RequestId $RequestId
+      }
 
-    $hdds = @($catalog.hdds | Where-Object { $_.projectId -eq $projectId } |
-      ForEach-Object {
-        [pscustomobject]@{
-          id = $_.id
-          name = $_.name
-          diameter = $_.diameter
-          station = $_.station
+      $hdds = Get-HddRecordsFromStorage -ProjectId $projectId
+      return New-ApiResponse -StatusCode 200 -Payload @{
+        projectId = $projectId
+        hdds = @($hdds)
+      }
+    } catch {
+      Write-LogEntry `
+        -Level "WARN" `
+        -Message "HDD-Ordner konnten nicht geladen werden." `
+        -RequestId $RequestId `
+        -Method $Method `
+        -Path $Url.AbsolutePath `
+        -StatusCode 503 `
+        -Data @{
+          projectId = $projectId
+          error = $_.Exception.Message
         }
-      })
-
-    return New-ApiResponse -StatusCode 200 -Payload @{
-      projectId = $projectId
-      hdds = $hdds
+      return New-ApiErrorResponse `
+        -StatusCode 503 `
+        -Code "hdds_unavailable" `
+        -Message "HDD-Ordner konnten nicht geladen werden." `
+        -RequestId $RequestId
     }
   }
 
@@ -1282,16 +1499,17 @@ function Get-ReasonPhrase {
   param([int]$StatusCode)
 
   switch ($StatusCode) {
-    401 { "Unauthorized" }
     200 { "OK" }
     201 { "Created" }
     204 { "No Content" }
     400 { "Bad Request" }
+    401 { "Unauthorized" }
     404 { "Not Found" }
     405 { "Method Not Allowed" }
     413 { "Payload Too Large" }
     415 { "Unsupported Media Type" }
     500 { "Internal Server Error" }
+    503 { "Service Unavailable" }
     default { "OK" }
   }
 }
@@ -1477,10 +1695,8 @@ $listener.Start()
 
 Write-Host "KKM Capture API laeuft auf http://0.0.0.0:$Port/"
 Write-Host "Lokal erreichbar unter http://localhost:$Port/"
-Write-Host "Datenquelle: $DataPath"
+Write-Host "Upload-Ziel: $(Get-StorageTargetDescription)"
 Write-Host "Storage-Modus: $(Get-StorageMode)"
-Write-Host "Storage-Ziel: $(Get-StorageTargetDescription)"
-Write-Host "Upload-Ziel lokal: $UploadRoot"
 Write-Host "Logdatei: $LogPath"
 Write-Host "Beenden mit Strg+C"
 
@@ -1490,7 +1706,6 @@ Write-LogEntry `
   -StatusCode 200 `
   -Data @{
     port = $Port
-    dataPath = $DataPath
     uploadRoot = $UploadRoot
     logPath = $LogPath
     storageMode = Get-StorageMode
