@@ -1157,12 +1157,10 @@ function Save-BatchUpload {
   $projectSegments = @((Get-StorageBaseSegments) + @($metadata.projectFolder))
   $hddSegments = @($projectSegments + @($metadata.hddFolder))
   $targetSegments = @($hddSegments + @($metadata.sideLabel))
-  $manifestSegments = @($targetSegments + @("_batches"))
 
   Ensure-StorageDirectory -PathSegments $projectSegments | Out-Null
   Ensure-StorageDirectory -PathSegments $hddSegments | Out-Null
   Ensure-StorageDirectory -PathSegments $targetSegments | Out-Null
-  Ensure-StorageDirectory -PathSegments $manifestSegments | Out-Null
 
   $savedFiles = @()
   $counter = Get-NextSequenceNumber -TargetPathSegments $targetSegments
@@ -1196,26 +1194,6 @@ function Save-BatchUpload {
 
     $counter++
   }
-
-  $manifest = [ordered]@{
-    batchId = $batchId
-    uploadedAt = (Get-Date).ToUniversalTime().ToString("o")
-    storageMode = Get-StorageMode
-    projectId = $metadata.projectId
-    projectName = $metadata.projectName
-    hddId = $metadata.hddId
-    hddName = $metadata.hddName
-    side = $metadata.side
-    sideLabel = $metadata.sideLabel
-    fileCount = $savedFiles.Count
-    files = $savedFiles
-  }
-
-  $manifestJson = $manifest | ConvertTo-Json -Depth 12
-  Save-StorageText `
-    -PathSegments $manifestSegments `
-    -FileName "$batchId.json" `
-    -ContentText $manifestJson
 
   return [pscustomobject]@{
     batchId = $batchId
